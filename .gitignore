@@ -7,3 +7,8 @@ env/
 secrets.toml
 .streamlit/secrets.toml
 
+# Python cache and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
