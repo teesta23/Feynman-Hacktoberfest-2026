@@ -4,6 +4,6 @@ venv/
 env/
 
 # Ignore local Streamlit secrets
-.streamlit/secrets.toml
 secrets.toml
+.streamlit/secrets.toml
 
