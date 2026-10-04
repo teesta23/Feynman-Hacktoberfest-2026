@@ -1,19 +1,27 @@
-"""TeachBack: learn by teaching.
+"""Feynman Buddy: learn by teaching.
 
-Flow: pick a topic -> teach it (voice or typing) -> answer the question TeachBack
+Flow: pick a topic -> teach it (voice or typing) -> answer the question Feynman Buddy
 asks -> get scored -> follow-up question or teach more. Stuck? Ask for any term.
 
 AI runs on Snowflake Cortex COMPLETE with an open-weight model (Llama / Mistral).
 Without Snowflake secrets the app runs in demo mode with offline replies, so the
 whole flow still clicks through. Voice uses open-source Whisper if installed.
+
+Extras: pick who you're teaching (persona), upload your syllabus so questions stay
+in scope, rate your confidence before answering (catches "confidently wrong"),
+a knowledge gap map, and spaced recall that tells you when to re-teach a topic.
 """
 import html
 import json
 import os
 import re
 import tempfile
+import threading
 import uuid
 from collections import Counter
+from copy import deepcopy
+from datetime import date, timedelta
+from pathlib import Path
 
 import streamlit as st
 
@@ -27,8 +35,23 @@ try:
 except ImportError:
     snowflake = None
 
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+# Team helpers (same folder): Groq Llama via ai_helper, Snowflake MESSAGES / KNOWLEDGE_GAPS via db_helper.
+try:
+    import ai_helper
+except Exception:  # missing file or `groq` not installed
+    ai_helper = None
+try:
+    import db_helper
+except Exception:
+    db_helper = None
+
 st.set_page_config(
-    page_title="TeachBack",
+    page_title="Feynman Buddy",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -53,17 +76,157 @@ DEFAULTS = {
     "pending_term": None,  # term waiting to be explained
     "llm_error": "",
     "session_id": str(uuid.uuid4()),
+    "concepts": {},        # knowledge map: concept -> "strong" | "gap"
+    "calibration": [],     # (confidence %, score) per answer
+    "next_recall": "",
+    "synced_msgs": 0,      # how many messages db_helper has already saved
+    "synced_gaps": set(),
 }
 for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = deepcopy(v)
+# These survive "New chat"
+for k, v in {"persona": "🙋 Curious classmate", "syllabus": "", "syllabus_name": ""}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
 def reset_chat():
+    mic_n = st.session_state.mic_n
     for k, v in DEFAULTS.items():
-        st.session_state[k] = v if not isinstance(v, list) else []
+        st.session_state[k] = deepcopy(v)
     st.session_state.session_id = str(uuid.uuid4())
-    st.session_state.mic_n += 1
+    st.session_state.mic_n = mic_n + 1
+
+
+# ---------------------------------------------------------------------------
+# Personas: who the user is teaching
+# ---------------------------------------------------------------------------
+PERSONAS = {
+    "🙋 Curious classmate": {
+        "style": "a friendly, curious classmate who missed the lesson. Ask natural 'wait, why?' questions.",
+        "reaction": "Ooh nice, I like how you brought up **{t}**. Let me poke at that a little. 👀",
+        "question": "You mentioned {t}. Why does it matter for {topic}? What would go wrong if it wasn't there?",
+    },
+    "🧒 Confused 10-year-old": {
+        "style": "a curious, easily confused 10-year-old. Use very simple words, ask for everyday examples, ask 'but why?' a lot.",
+        "reaction": "Wait wait... so **{t}** is a thing?? 🤔 I kinda get it but my brain is confused!",
+        "question": "Can you explain {t} like I'm 10, with a toy or a snack example? Why does {topic} need it?",
+    },
+    "🧐 Skeptical professor": {
+        "style": "a skeptical university professor. Challenge assumptions, demand precise definitions, edge cases and evidence.",
+        "reaction": "Hmm. You claim **{t}** matters. I'm not convinced yet. 🧐",
+        "question": "Define {t} precisely. Under what conditions would your explanation of {topic} break down?",
+    },
+    "📝 Exam examiner": {
+        "style": "a strict exam examiner. Ask exam-style questions on definitions, mechanisms and application, worded like a real paper with marks.",
+        "reaction": "Noted. Let's see if **{t}** holds up under exam conditions. 📝",
+        "question": "[5 marks] Explain the role of {t} in {topic}, and give one worked example.",
+    },
+}
+
+
+def persona():
+    return PERSONAS.get(st.session_state.persona, PERSONAS["🙋 Curious classmate"])
+
+
+# ---------------------------------------------------------------------------
+# Syllabus: keep questions and explanations inside the user's own notes
+# ---------------------------------------------------------------------------
+def read_syllabus(file):
+    if file.name.lower().endswith(".pdf"):
+        if PdfReader is None:
+            return ""
+        return "\n".join((pg.extract_text() or "") for pg in PdfReader(file).pages)
+    return file.getvalue().decode("utf-8", errors="ignore")
+
+
+def syllabus_chunks(query, k=3):
+    text = st.session_state.syllabus
+    if not text:
+        return []
+    sents = re.split(r"(?<=[.!?])\s+|\n{2,}", text)
+    chunks, cur = [], ""
+    for sent in sents:
+        if len(cur) + len(sent) > 500 and cur:
+            chunks.append(cur.strip())
+            cur = ""
+        cur += " " + sent
+    if cur.strip():
+        chunks.append(cur.strip())
+    q = set(re.findall(r"[a-z]{4,}", query.lower()))
+    scored = sorted(chunks, key=lambda c: -len(q & set(re.findall(r"[a-z]{4,}", c.lower()))))
+    return [c for c in scored[:k] if q & set(re.findall(r"[a-z]{4,}", c.lower()))] or scored[:1]
+
+
+def syllabus_prompt(query):
+    chunks = syllabus_chunks(query)
+    if not chunks:
+        return ""
+    joined = "\n".join(f"- {c[:600]}" for c in chunks)
+    return f"\nThe student's own syllabus notes (stay within these, ask about what they skipped):\n{joined}\n"
+
+
+# ---------------------------------------------------------------------------
+# Spaced recall: when to re-teach each topic (Snowflake, or a local file in demo mode)
+# ---------------------------------------------------------------------------
+RECALL_FILE = Path(__file__).with_name("recall_schedule.json")
+
+
+def recall_interval(score):
+    return 1 if score < 50 else 3 if score < 80 else 7
+
+
+def load_recalls():
+    conn, _ = get_conn()
+    if conn is not None:
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT TOPIC, DUE_DATE, MASTERY, GAPS FROM FEYNMAN_BUDDY_RECALL
+                   QUALIFY ROW_NUMBER() OVER (PARTITION BY TOPIC ORDER BY CREATED_AT DESC) = 1"""
+            )
+            rows = {r[0]: {"due": str(r[1]), "mastery": r[2], "gaps": json.loads(r[3] or "[]")} for r in cur.fetchall()}
+            cur.close()
+            return rows
+        except Exception:
+            pass  # table not created yet
+    try:
+        return json.loads(RECALL_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_recall(topic, mastery_pct, gaps):
+    due = (date.today() + timedelta(days=recall_interval(mastery_pct))).isoformat()
+    st.session_state.next_recall = due
+    conn, _ = get_conn()
+    if conn is not None:
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS FEYNMAN_BUDDY_RECALL (TOPIC STRING, DUE_DATE DATE, MASTERY INT,
+                   GAPS VARIANT, CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())"""
+            )
+            cur.execute(
+                "INSERT INTO FEYNMAN_BUDDY_RECALL (TOPIC, DUE_DATE, MASTERY, GAPS) SELECT %s, %s, %s, PARSE_JSON(%s)",
+                (topic, due, mastery_pct, json.dumps(gaps)),
+            )
+            cur.close()
+            return
+        except Exception as e:
+            st.session_state.llm_error = f"recall save failed: {str(e)[:150]}"
+    try:
+        data = load_recalls()
+        data[topic] = {"due": due, "mastery": mastery_pct, "gaps": gaps}
+        RECALL_FILE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def due_label(due):
+    days = (date.fromisoformat(due) - date.today()).days
+    return "due now" if days <= 0 else "tomorrow" if days == 1 else f"in {days} days"
 
 
 def mastery():
@@ -95,8 +258,38 @@ def get_conn():
 CORTEX_MODEL = _secret_section("cortex").get("model", "llama3.1-70b")
 
 
+GROQ_MODEL = _secret_section("groq").get("model", "llama-3.3-70b-versatile")
+
+
+@st.cache_resource(show_spinner=False)
+def get_groq():
+    if ai_helper is None or not _secret_section("groq").get("api_key"):
+        return None
+    try:
+        return ai_helper.get_groq_client()
+    except Exception:
+        return None
+
+
+def ai_backend():
+    if get_groq() is not None:
+        return f"🟢 AI: Groq · {GROQ_MODEL} (open-weight Llama)"
+    if get_conn()[0] is not None:
+        return f"🟢 AI: Snowflake Cortex · {CORTEX_MODEL}"
+    return "🟡 AI: demo mode (add [groq] or [snowflake] secrets)"
+
+
 def cortex(prompt):
-    """Return model text, or None if Cortex isn't available (caller falls back)."""
+    """Return model text: Groq (ai_helper) first, then Snowflake Cortex, else None (demo fallback)."""
+    client = get_groq()
+    if client is not None:
+        try:
+            r = client.chat.completions.create(
+                model=GROQ_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0.4
+            )
+            return r.choices[0].message.content.strip()
+        except Exception as e:
+            st.session_state.llm_error = f"Groq: {str(e)[:150]}"
     conn, _ = get_conn()
     if conn is None:
         return None
@@ -130,7 +323,8 @@ STOP = set(
     during each from further have having here into itself just more most other over same should
     some such than that their theirs them then there these they this those through under until very
     what when where which while whom with would your yours basically actually really thing things
-    like kind going gonna means called something someone because which""".split()
+    like kind going gonna means called something someone because which needs uses using makes makes
+    gives cause causes become becomes always never every""".split()
 )
 
 
@@ -142,35 +336,39 @@ def guess_terms(text, n=3, skip=""):
 
 
 def ai_question(topic, explanation, latest):
-    prompt = f"""You are TeachBack, a friendly tutor using the Feynman technique.
-A student is teaching you "{topic}". Everything they have explained so far:
+    p = persona()
+    prompt = f"""You are Feynman Buddy, playing {p["style"]}
+A student is teaching you "{topic}" (Feynman technique). Everything they have explained so far:
 \"\"\"{explanation}\"\"\"
 Their latest message: \"\"\"{latest}\"\"\"
 
+{syllabus_prompt(topic + " " + explanation)}
 Find the most important idea they skipped, got wrong, or described without explaining WHY.
-Reply with ONLY a JSON object:
-{{"reaction": "1-2 warm sentences reacting to what they said (no answers, no lecturing)",
+Stay in character. Reply with ONLY a JSON object:
+{{"reaction": "1-2 sentences reacting in character to what they said (no answers, no lecturing)",
   "question": "ONE conceptual question that makes them explain why/how, tied to what they said",
   "key_terms": ["2-4 key terms for this question that they might need explained"]}}"""
     data = parse_json(cortex(prompt))
     if data and data.get("question"):
         return data
-    terms = guess_terms(explanation, skip=topic) or [topic]
+    # Demo mode: with a syllabus, ask about a term from the notes they did NOT mention.
+    notes = " ".join(syllabus_chunks(topic + " " + explanation))
+    skipped = guess_terms(notes, 2, skip=topic + " " + explanation) if notes else []
+    terms = (skipped + guess_terms(explanation, skip=topic))[:3] or [topic]
     t = terms[0]
     return {
-        "reaction": f"Ooh nice, I like how you brought up **{t}**. Let me poke at that a little. 👀",
-        "question": f"You mentioned {t}. Why does it matter for {topic}? "
-        f"What would go wrong if it wasn't there?",
+        "reaction": p["reaction"].format(t=t, topic=topic),
+        "question": p["question"].format(t=t, topic=topic),
         "key_terms": terms,
     }
 
 
 def ai_grade(topic, explanation, question, answer):
-    prompt = f"""You are TeachBack, grading how well a student understands "{topic}".
+    prompt = f"""You are Feynman Buddy, grading how well a student understands "{topic}".
 What they taught earlier: \"\"\"{explanation}\"\"\"
 Question asked: \"\"\"{question}\"\"\"
 Their answer: \"\"\"{answer}\"\"\"
-
+{syllabus_prompt(question + " " + answer)}
 Grade their understanding of the reasoning, not their wording. Reply with ONLY a JSON object:
 {{"score": integer 0-100,
   "feedback": "2-3 encouraging sentences: what they got right, then the gap (hint at it, don't fully solve it)",
@@ -186,11 +384,11 @@ Grade their understanding of the reasoning, not their wording. Reply with ONLY a
     n_words = len(answer.split())
     has_why = bool(re.search(r"\b(because|so that|which means|therefore|since|so)\b", answer.lower()))
     score = min(95, 35 + min(n_words, 60) // 2 + (15 if has_why else 0))
-    gaps = guess_terms(question, 2, skip=topic)
+    gaps = [t for t in st.session_state.key_terms if t.lower() not in answer.lower()][:2]
     return {
         "score": score,
         "feedback": (
-            "Nice! 🎉 You've got the main idea. "
+            ("Nice! 🎉 You've got the main idea. " if score >= 60 else "Good start! 💗 But that answer is still thin. ")
             + ("I like that you explained the *why*, not just the what. " if has_why else
                "Try adding the *why*: use a 'because...' to connect cause and effect. ")
             + "There's still a small gap in the deeper reasoning, but you're getting there."
@@ -202,7 +400,8 @@ Grade their understanding of the reasoning, not their wording. Reply with ONLY a
 
 def ai_explain(topic, term):
     prompt = f"""A student learning "{topic}" is stuck on "{term}".
-Explain it simply in markdown, under 120 words:
+{syllabus_prompt(term + " " + topic)}
+Explain it simply in markdown, under 120 words, using their notes first if they cover it:
 **{term}:** one-sentence definition in plain words.
 **Think of it like:** a simple analogy.
 **Why it matters here:** 1-2 sentences linking it to {topic}.
@@ -210,6 +409,10 @@ Don't answer any question they're working on for them."""
     out = cortex(prompt)
     if out:
         return out
+    hits = [c for c in syllabus_chunks(term) if term.lower() in c.lower()]
+    if hits:
+        sent = next((x for x in re.split(r"(?<=[.!?])\s+", hits[0]) if term.lower() in x.lower()), hits[0])
+        return f"📄 **From your notes:** {sent.strip()[:400]}\n**Why it matters here:** this is part of {topic} in your syllabus."
     return (
         f"**{term}:** (demo mode) a short, plain-words definition would appear here once "
         f"Snowflake Cortex is connected.\n**Think of it like:** a simple everyday analogy.\n"
@@ -225,21 +428,30 @@ def save_attempt(question, answer, result):
     try:
         cur = conn.cursor()
         cur.execute(
-            """CREATE TABLE IF NOT EXISTS TEACHBACK_ATTEMPTS (
+            """CREATE TABLE IF NOT EXISTS FEYNMAN_BUDDY_ATTEMPTS (
                 SESSION_ID STRING, TOPIC STRING, EXPLANATION STRING, QUESTION STRING,
                 ANSWER STRING, SCORE INT, FEEDBACK STRING, GAPS VARIANT,
-                CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())"""
+                CONFIDENCE INT, PERSONA STRING, CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())"""
         )
         cur.execute(
-            """INSERT INTO TEACHBACK_ATTEMPTS
-               (SESSION_ID, TOPIC, EXPLANATION, QUESTION, ANSWER, SCORE, FEEDBACK, GAPS)
-               SELECT %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s)""",
+            """INSERT INTO FEYNMAN_BUDDY_ATTEMPTS
+               (SESSION_ID, TOPIC, EXPLANATION, QUESTION, ANSWER, SCORE, FEEDBACK, GAPS, CONFIDENCE, PERSONA)
+               SELECT %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, %s""",
             (
                 st.session_state.session_id, st.session_state.topic, st.session_state.explanation,
                 question, answer, result["score"], result.get("feedback", ""),
-                json.dumps(result.get("gaps", [])),
+                json.dumps(result.get("gaps", [])), result.get("confidence"), st.session_state.persona,
             ),
         )
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS FEYNMAN_BUDDY_CONCEPTS (SESSION_ID STRING, TOPIC STRING,
+               CONCEPT STRING, STATUS STRING, CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())"""
+        )
+        for concept, status in st.session_state.concepts.items():
+            cur.execute(
+                "INSERT INTO FEYNMAN_BUDDY_CONCEPTS (SESSION_ID, TOPIC, CONCEPT, STATUS) VALUES (%s, %s, %s, %s)",
+                (st.session_state.session_id, st.session_state.topic, concept, status),
+            )
         cur.close()
     except Exception as e:
         st.session_state.llm_error = f"save failed: {str(e)[:150]}"
@@ -273,6 +485,45 @@ def add(role, content, kind="text"):
     st.session_state.messages.append({"role": role, "kind": kind, "content": content})
 
 
+def sync_to_team_db():
+    """Send new chat messages and new gaps to the team's Snowflake tables via db_helper.
+    Runs in a background thread so the UI never waits on (or crashes from) Snowflake."""
+    s = st.session_state
+    if db_helper is None or not _secret_section("snowflake"):
+        return
+    new_msgs = [(("user" if m["role"] == "user" else "assistant"), m["content"])
+                for m in s.messages[s.get("synced_msgs", 0):]]
+    s.synced_msgs = len(s.messages)
+    new_gaps = [c for c, v in s.concepts.items() if v == "gap" and c not in s.get("synced_gaps", set())]
+    s.synced_gaps = s.get("synced_gaps", set()) | set(new_gaps)
+    sid = s.session_id
+
+    def work():
+        for sender, content in new_msgs:
+            try:
+                db_helper.save_message(sid, sender, content)
+            except Exception:
+                pass
+        for concept in new_gaps:
+            try:
+                db_helper.save_knowledge_gap(sid, concept)
+            except Exception:
+                pass
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def team_check(notes, explanation):
+    """Use the team's ai_helper evaluator on the full explanation (adds its gaps to the map)."""
+    if ai_helper is None or get_groq() is None:
+        return None
+    try:
+        r = ai_helper.evaluate_explanation_open_source(notes, explanation)
+        return None if r.get("error") else r
+    except Exception:
+        return None
+
+
 def handle(text):
     """Route one user message (typed or spoken) based on the current stage."""
     s = st.session_state
@@ -283,8 +534,17 @@ def handle(text):
     if s.stage == "topic":
         s.topic = text[:80]
         s.stage = "teach"
-        add("ai", f"Ooh, **{s.topic}**! 💗 Teach it to me like I'm your friend who missed class. "
-                  "Talk or type, whatever's easier. Don't worry about being perfect.")
+        past = load_recalls().get(s.topic)
+        if past:
+            gaps = past.get("gaps") or []
+            for g in gaps:
+                s.concepts[g] = "gap"
+            add("ai", f"🔁 **Recall time: {s.topic}!** Last time you scored {past.get('mastery', '?')}%. "
+                      + (f"You struggled with **{', '.join(gaps)}**. " if gaps else "")
+                      + "Teach it to me again from memory, no notes! 💪")
+        else:
+            add("ai", f"Ooh, **{s.topic}**! 💗 I'm your {s.persona.split(' ', 1)[1].lower()} today. "
+                      "Teach it to me! Talk or type, whatever's easier. Don't worry about being perfect.")
         return
 
     add("user", text)
@@ -292,6 +552,11 @@ def handle(text):
     if s.stage in ("teach", "next"):
         s.explanation = (s.explanation + "\n" + text).strip()
         q = ai_question(s.topic, s.explanation, text)
+        team = team_check(s.syllabus[:8000] or f"Standard curriculum for: {s.topic}", s.explanation)
+        if team:
+            for g in team.get("gaps", [])[:4]:
+                if s.concepts.get(g) != "strong":
+                    s.concepts[g] = "gap"
         add("ai", q.get("reaction", ""))
         s.question = q["question"]
         s.key_terms = [t for t in q.get("key_terms", []) if t][:4]
@@ -306,12 +571,29 @@ def handle(text):
             add("ai", ai_explain(s.topic, term), kind="explain")
             return
         r = ai_grade(s.topic, s.explanation, s.question, text)
+        conf = int(s.get("confidence", 3)) * 20
+        r["confidence"] = conf
         s.scores.append(r["score"])
-        save_attempt(s.question, text, r)
+        s.calibration.append((conf, r["score"]))
         gaps = [g for g in r.get("gaps", []) if g]
+        # Knowledge map: gaps go red, question terms go green when the answer was solid
+        for g in gaps:
+            s.concepts[g] = "gap"
+        for t in s.key_terms[:2]:
+            if t not in gaps:
+                s.concepts[t] = "strong" if r["score"] >= 70 else "gap"
+        save_attempt(s.question, text, r)
+        save_recall(s.topic, mastery(), [c for c, v in s.concepts.items() if v == "gap"])
         body = f"**{r['score']}/100** · {r.get('feedback', '')}"
         if gaps:
             body += "\n**Worth revisiting:** " + ", ".join(gaps)
+        if conf >= 80 and r["score"] < 60:
+            body += (f"\n⚠️ **Confidently wrong!** You felt {conf}% sure but scored {r['score']}. That's the "
+                     "*illusion of competence*, and it's exactly where to revise first.")
+        elif conf <= 40 and r["score"] >= 70:
+            body += f"\n🌱 **You know more than you think!** Only {conf}% sure, but you scored {r['score']}."
+        else:
+            body += f"\n🎯 Confidence {conf}% vs score {r['score']}: nicely calibrated."
         add("ai", body, kind="feedback")
         s.key_terms = (gaps + [t for t in s.key_terms if t not in gaps])[:4]
         s.follow_up = r.get("follow_up", "")
@@ -380,7 +662,7 @@ html, body, [class*="css"], .stMarkdown, button, input, textarea { font-family: 
 [data-testid="stSidebar"] * { color: #FFF7FA; }
 [data-testid="stBottom"], [data-testid="stBottom"] > div, [data-testid="stBottomBlockContainer"] { background: transparent !important; }
 .block-container { max-width: 1050px; padding-top: 1.5rem; padding-bottom: 8rem; }
-.brand { font-family: "Fredoka", sans-serif; font-size: 2rem; font-weight: 700; letter-spacing: -0.5px; }
+.brand { font-family: "Fredoka", sans-serif; font-size: 1.55rem; white-space: nowrap; font-weight: 700; letter-spacing: -0.5px; }
 .tagline { color: #EAB4C8; font-size: 0.98rem; margin-bottom: 25px; }
 .hero { text-align: center; padding: 12px 0 22px 0; }
 .hero-title { font-family: "Fredoka", sans-serif; font-size: 3.3rem; font-weight: 700; letter-spacing: -1px; color: white; margin: 0; }
@@ -441,6 +723,13 @@ html, body, [class*="css"], .stMarkdown, button, input, textarea { font-family: 
 .stButton > button[kind="primary"]:hover { background: #6E1739 !important; }
 [data-testid="stSidebar"] .stButton > button { background: #FFD8E7 !important; color: #4B2637 !important; border-color: #FFD8E7 !important; }
 .stButton > button * { color: inherit !important; background: transparent !important; border: none !important; }
+/* Recorder and playback strip: light so it stands out from the pink background */
+[data-testid="stAudioInput"], [data-testid="stAudioInput"] > div, [data-testid="stAudio"], audio {
+    background: #FFF5F8 !important; border-radius: 16px !important; color: #4B2637 !important;
+}
+[data-testid="stAudioInput"] > div { border: 1px solid #F1B6CB !important; }
+[data-testid="stAudioInput"] *, [data-testid="stAudioInput"] svg { color: #8E204B !important; fill: #8E204B; }
+[data-testid="stAudioInput"] canvas { background: #FFF5F8 !important; }
 /* Inputs: white field, dark text */
 [data-testid="stChatInput"], [data-testid="stChatInput"] > div, [data-testid="stChatInput"] textarea { background: #FFFFFF !important; color: #2E1420 !important; }
 [data-testid="stChatInput"] textarea::placeholder, .stTextInput input::placeholder { color: #8B6877 !important; }
@@ -449,6 +738,21 @@ html, body, [class*="css"], .stMarkdown, button, input, textarea { font-family: 
 .stTextInput input, .stTextArea textarea { background: #FFFFFF !important; color: #2E1420 !important; border: 1px solid #F1B6CB !important; }
 [data-testid="stChatInput"] textarea { font-size: 1.05rem !important; }
 .stTextInput input, .stTextArea textarea { font-size: 1.05rem !important; border-radius: 15px !important; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 4px 0; }
+.chip { padding: 6px 13px; border-radius: 999px; font-size: 0.92rem; font-weight: 600; }
+.chip.strong { background: #DDF5E7; color: #1F5A38 !important; border: 1px solid #9ED8B5; }
+.chip.gap { background: #FFE1E1; color: #8A1C1C !important; border: 1px solid #F3A5A5; }
+.st-key-mapbox { background: rgba(255,255,255,0.96); border-radius: 28px; padding: 20px 22px;
+    box-shadow: 0 18px 45px rgba(40,0,20,0.20); margin: 18px auto; }
+.st-key-mapbox * { color: #432333; }
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] { background: rgba(255,255,255,0.10); }
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button { background: #FFD8E7 !important; }
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button * { color: #4B2637 !important; }
+[data-baseweb="select"] > div { background: #FFFFFF !important; }
+[data-baseweb="select"] *, [data-testid="stSidebar"] [data-baseweb="select"] *, [data-baseweb="popover"] li, [data-baseweb="popover"] li * { color: #2E1420 !important; -webkit-text-fill-color: #2E1420 !important; }
+[data-testid="stSidebar"] [data-testid="stSelectbox"] > div > div, [data-testid="stSidebar"] [data-testid="stSelectbox"] > div > div > div { background: #FFFFFF !important; }
+[data-testid="stSidebar"] [data-testid="stSelectbox"] div, [data-testid="stSidebar"] [data-testid="stSelectbox"] input, [data-testid="stSidebar"] [data-testid="stSelectbox"] span { color: #2E1420 !important; -webkit-text-fill-color: #2E1420 !important; opacity: 1 !important; }
+.st-key-composer [role="radiogroup"] label * { color: #432333 !important; }
 @media (max-width: 700px) {
     .hero-title { font-size: 2.5rem; }
     .user-bubble, .ai-bubble { max-width: 88%; }
@@ -484,10 +788,22 @@ def render_message(m):
     body = fmt(m["content"])
     if kind == "question":
         body = f'<div class="q-text">{body}</div>'
+    emoji, pname = st.session_state.persona.split(" ", 1)
     show(
-        f'<div class="ai-row"><div class="ai-avatar">🧠</div>'
-        f'<div class="ai-bubble {kind}"><div class="ai-name">{NAMES.get(kind, "TeachBack")}</div>{body}</div></div>'
+        f'<div class="ai-row"><div class="ai-avatar">{emoji}</div>'
+        f'<div class="ai-bubble {kind}"><div class="ai-name">{NAMES.get(kind, "Feynman Buddy · " + pname)}</div>{body}</div></div>'
     )
+
+
+def knowledge_map_html():
+    c = st.session_state.concepts
+    if not c:
+        return ""
+    chips = "".join(
+        f'<span class="chip {v}">{"✅" if v == "strong" else "❌"} {html.escape(k)}</span>'
+        for k, v in sorted(c.items(), key=lambda kv: kv[1] != "strong")
+    )
+    return f'<div class="chips">{chips}</div>'
 
 
 # ---------------------------------------------------------------------------
@@ -495,8 +811,23 @@ def render_message(m):
 # ---------------------------------------------------------------------------
 conn, conn_err = get_conn()
 with st.sidebar:
-    show('<div class="brand">🧠 TeachBack</div><div class="tagline">Learn by teaching ✨</div>')
+    show('<div class="brand">🧠 Feynman Buddy</div><div class="tagline">Learn by teaching ✨</div>')
     st.button("＋ New chat", use_container_width=True, on_click=reset_chat)
+    st.markdown("---")
+    st.markdown("### 🎭 Who are you teaching?")
+    st.selectbox("Persona", list(PERSONAS), key="persona", label_visibility="collapsed")
+    st.markdown("### 📄 Your syllabus (optional)")
+    up = st.file_uploader("Syllabus", type=["pdf", "txt", "md"], label_visibility="collapsed")
+    if up is not None and up.name != st.session_state.syllabus_name:
+        try:
+            st.session_state.syllabus = read_syllabus(up)[:60000]
+            st.session_state.syllabus_name = up.name
+        except Exception as e:
+            st.caption(f"Couldn't read that file ({e})")
+    elif up is None and st.session_state.syllabus_name:
+        st.session_state.syllabus, st.session_state.syllabus_name = "", ""
+    if st.session_state.syllabus:
+        st.caption(f"✅ Using {st.session_state.syllabus_name} · {len(st.session_state.syllabus.split())} words")
     st.markdown("---")
     if st.session_state.topic:
         st.markdown(f"### 📚 Learning\n**{html.escape(st.session_state.topic)}**")
@@ -505,20 +836,26 @@ with st.sidebar:
         show(f'<div class="mastery-score">{mastery()}%</div>')
         st.progress(mastery() / 100)
         st.caption(f"{len(st.session_state.scores)} answer(s) checked")
+        cal = st.session_state.calibration
+        if cal:
+            avg_c = round(sum(c for c, _ in cal) / len(cal))
+            st.caption(f"🎯 Felt {avg_c}% sure · scored {mastery()}%")
+        if st.session_state.next_recall:
+            st.caption(f"🔁 Re-teach this {due_label(st.session_state.next_recall)} ({st.session_state.next_recall})")
         st.markdown("---")
-    st.markdown("### 💡 How TeachBack works")
+    st.markdown("### 💡 How Feynman Buddy works")
     st.markdown(
         "**1️⃣ Teach** · explain it in your own words\n\n"
         "**2️⃣ Challenge** · I ask a question about what you said\n\n"
         "**3️⃣ Think** · answer without your notes\n\n"
         "**4️⃣ Diagnose** · I score it and spot the gaps\n\n"
-        "**5️⃣ Improve** · stuck? ask me to explain any term"
+        "**5️⃣ Improve** · stuck? ask me to explain any term\n\n"
+        "**6️⃣ Recall** · come back when it's due and re-teach it"
     )
     st.markdown("---")
+    st.caption(ai_backend())
     if conn is not None:
-        st.caption(f"🟢 AI: Snowflake Cortex · {CORTEX_MODEL}")
-    else:
-        st.caption("🟡 AI: demo mode (add Snowflake secrets for Cortex)")
+        st.caption("🟢 Snowflake: saving progress" + (" + team tables" if db_helper else ""))
     st.caption("🟢 Voice: Whisper" if whisper else "⚪ Voice off · pip install openai-whisper")
     if st.session_state.llm_error:
         st.caption(f"⚠️ Last AI error: {st.session_state.llm_error}")
@@ -527,7 +864,7 @@ with st.sidebar:
 # Main
 # ---------------------------------------------------------------------------
 show(
-    '<div class="hero"><div class="hero-title">TeachBack 🧠</div>'
+    '<div class="hero"><div class="hero-title">Feynman Buddy 🧠</div>'
     '<div class="hero-subtitle">Explain it. Get challenged. Actually understand it.</div></div>'
 )
 
@@ -536,7 +873,7 @@ s = st.session_state
 if s.stage == "topic" and not s.messages:
     show(
         '<div class="welcome"><div class="welcome-title">Hey! 👋 Let\'s learn something.</div>'
-        '<div class="welcome-text">TeachBack helps you learn by teaching. Pick a topic and explain it like '
+        '<div class="welcome-text">Feynman Buddy helps you learn by teaching. Pick a topic and explain it like '
         "you're teaching your friend. I'll listen, ask you a conceptual question, and help you discover any "
         "gaps in your understanding.<br><br><b>You don't have to be perfect. Just explain it how you "
         "understand it.</b> ✨</div></div>"
@@ -547,6 +884,16 @@ if s.stage == "topic" and not s.messages:
         cols = st.columns(4)
         for col, t in zip(cols, ["Recursion", "Photosynthesis", "Newton's laws", "Supply and demand"]):
             col.button(t, use_container_width=True, on_click=pick_topic, args=(t,))
+        recalls = sorted(load_recalls().items(), key=lambda kv: kv[1].get("due", ""))
+        if recalls:
+            show('<div class="card-label" style="margin-top:14px">🔁 Spaced recall: re-teach from memory</div>')
+            cols = st.columns(min(len(recalls), 3))
+            for i, (t, info) in enumerate(recalls[:6]):
+                cols[i % len(cols)].button(
+                    f"{t} · {info.get('mastery', '?')}% · {due_label(info['due'])}", key=f"recall_{i}",
+                    use_container_width=True, on_click=pick_topic, args=(t,),
+                    type="primary" if due_label(info["due"]) == "due now" else "secondary",
+                )
 
 for m in s.messages:
     render_message(m)
@@ -554,14 +901,18 @@ for m in s.messages:
 # Run queued AI work right here, under the chat, so the spinner sits where the reply will appear.
 if s.pending is not None:
     text, s.pending = s.pending, None
-    with st.spinner("🧠 TeachBack is thinking..."):
+    with st.spinner("🧠 Feynman Buddy is thinking..."):
         handle(text)
+    sync_to_team_db()
     st.rerun()
 if s.pending_term:
     term, s.pending_term = s.pending_term, None
     add("user", f"Can you explain **{term}**?")
+    if s.concepts.get(term) != "strong":
+        s.concepts[term] = "gap"
     with st.spinner(f"💡 Explaining {term}..."):
         add("ai", ai_explain(s.topic, term), kind="explain")
+    sync_to_team_db()
     st.rerun()
 
 # Contextual action area: exactly one mic, whose meaning follows the stage.
@@ -570,8 +921,13 @@ if s.stage in ("teach", "answer"):
         if s.stage == "teach":
             title, sub = f"🎙️ Teach me {html.escape(s.topic)}", "Explain it in your own words. Pauses are okay!"
         else:
-            title, sub = "🎙️ Answer TeachBack", "Explain your reasoning out loud. Take your time."
+            title, sub = "🎙️ Answer Feynman Buddy", "Explain your reasoning out loud. Take your time."
         show(f'<div class="record-title">{title}</div><div class="record-subtitle">{sub}</div>{WAVE}')
+        if s.stage == "answer":
+            st.radio(
+                "Before you answer: how sure are you?", [1, 2, 3, 4, 5], index=2, key="confidence", horizontal=True,
+                format_func=lambda v: ["😬 Guessing", "🤔 Unsure", "🙂 Fairly sure", "😎 Confident", "💯 Certain"][v - 1],
+            )
 
         if s.draft:
             st.markdown("**📝 I heard you say...** (fix anything I misheard)")
@@ -608,6 +964,11 @@ if s.stage == "answer":
             "Explain a term", key="term_box", placeholder="Type any word you're unsure about and press Enter",
             label_visibility="collapsed", on_change=ask_custom_term,
         )
+
+if s.concepts and s.stage in ("next", "answer"):
+    with st.container(key="mapbox"):
+        show('<div class="card-label">🗺️ Your knowledge map</div>' + knowledge_map_html())
+        st.caption("✅ explained well · ❌ gap to revise" + (" · saved to Snowflake" if conn is not None else ""))
 
 if s.stage == "next":
     with st.container(key="nextbox"):
