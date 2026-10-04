@@ -1,0 +1,6 @@
+streamlit
+groq
+snowflake-connector-python
+pandas
+pypdf
+openai-whisper
